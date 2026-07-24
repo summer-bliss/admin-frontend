@@ -4,6 +4,69 @@ import { UploadCloud, Image as ImageIcon, X, CheckCircle, RefreshCw, Trash2, Edi
 import Button from '../components/ui/Button'
 import useHomePageStore from '../lib/homePageStore'
 
+const MAX_FILE_SIZE = 10 * 1024 * 1024
+
+const compressImage = (file) => {
+  return new Promise((resolve, reject) => {
+    if (file.size <= MAX_FILE_SIZE) {
+      resolve(file)
+      return
+    }
+
+    const img = new Image()
+    const objectUrl = URL.createObjectURL(file)
+
+    img.onload = () => {
+      URL.revokeObjectURL(objectUrl)
+
+      const MAX_DIMENSION = 3840
+      let { width, height } = img
+      if (width > MAX_DIMENSION || height > MAX_DIMENSION) {
+        const ratio = Math.min(MAX_DIMENSION / width, MAX_DIMENSION / height)
+        width = Math.round(width * ratio)
+        height = Math.round(height * ratio)
+      }
+
+      const canvas = document.createElement('canvas')
+      canvas.width = width
+      canvas.height = height
+      const ctx = canvas.getContext('2d')
+      ctx.drawImage(img, 0, 0, width, height)
+
+      const tryCompress = (quality) => {
+        canvas.toBlob(
+          (blob) => {
+            if (!blob) {
+              reject(new Error('Canvas compression failed'))
+              return
+            }
+            if (blob.size <= MAX_FILE_SIZE || quality <= 0.1) {
+              const compressed = new File([blob], file.name, {
+                type: 'image/jpeg',
+                lastModified: Date.now(),
+              })
+              resolve(compressed)
+            } else {
+              tryCompress(Math.max(quality - 0.1, 0.1))
+            }
+          },
+          'image/jpeg',
+          quality,
+        )
+      }
+
+      tryCompress(0.85)
+    }
+
+    img.onerror = () => {
+      URL.revokeObjectURL(objectUrl)
+      reject(new Error('Failed to load image for compression'))
+    }
+
+    img.src = objectUrl
+  })
+}
+
 function ImageSection({ title, description, maxImages, activeImages, sectionName, onUpload, onUpdate, onDelete, onRefresh, loading }) {
   const [dragActive, setDragActive] = useState(false)
   const [selectedFiles, setSelectedFiles] = useState([])
@@ -78,23 +141,30 @@ function ImageSection({ title, description, maxImages, activeImages, sectionName
     }
   }
 
+  const [uploadStatus, setUploadStatus] = useState('idle') // 'idle' | 'compressing' | 'uploading'
+
   const handleUpload = async () => {
     if (selectedFiles.length === 0) return
-    setIsUploading(true)
 
     const cloudName = import.meta.env.VITE_CLOUDINARY_CLOUD_NAME
     const uploadPreset = import.meta.env.VITE_CLOUDINARY_UPLOAD_PRESET
 
     if (!cloudName || !uploadPreset) {
       toast.error('Cloudinary configuration is missing. Please check your .env file.')
-      setIsUploading(false)
       return
     }
 
     try {
+      // Step 1 – compress any oversized images client-side
+      setUploadStatus('compressing')
+      const compressedFiles = await Promise.all(selectedFiles.map(compressImage))
+
+      // Step 2 – upload to Cloudinary
+      setUploadStatus('uploading')
+      setIsUploading(true)
       const uploadedUrls = []
 
-      for (const file of selectedFiles) {
+      for (const file of compressedFiles) {
         const formData = new FormData()
         formData.append('file', file)
         formData.append('upload_preset', uploadPreset)
@@ -112,6 +182,7 @@ function ImageSection({ title, description, maxImages, activeImages, sectionName
         }
       }
 
+      // Step 3 – save URLs to the database
       try {
         for (const url of uploadedUrls) {
           await onUpload({ image_url: url, section: sectionName })
@@ -128,6 +199,7 @@ function ImageSection({ title, description, maxImages, activeImages, sectionName
       toast.error('An error occurred while uploading the images.')
     } finally {
       setIsUploading(false)
+      setUploadStatus('idle')
     }
   }
 
@@ -311,9 +383,13 @@ function ImageSection({ title, description, maxImages, activeImages, sectionName
                   variant="primary"
                   size="md"
                   onClick={handleUpload}
-                  disabled={isUploading}
+                  disabled={isUploading || uploadStatus === 'compressing'}
                 >
-                  {isUploading ? 'Uploading...' : `Upload ${selectedFiles.length} Image${selectedFiles.length !== 1 ? 's' : ''}`}
+                  {uploadStatus === 'compressing'
+                    ? 'Compressing...'
+                    : uploadStatus === 'uploading'
+                      ? 'Uploading...'
+                      : `Upload ${selectedFiles.length} Image${selectedFiles.length !== 1 ? 's' : ''}`}
                 </Button>
               )}
             </div>
